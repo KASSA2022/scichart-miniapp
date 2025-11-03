@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Mini App — SBER Candles</title>
+
+  <!-- Telegram WebApp SDK -->
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+
+  <!-- SciChart.js (Community via CDN). Без ключа — с водяным знаком, для прототипа ок -->
+  <script src="https://cdn.jsdelivr.net/npm/scichart/dist/scichart.browser.js"></script>
+
+  <style>
+    html, body, #root { height: 100%; margin: 0; background: #1e1e1e; color: #e0e0e0; }
+    #status {
+      position: absolute; left: 8px; top: 8px; z-index: 10;
+      background: rgba(0,0,0,0.35); padding: 6px 8px; border-radius: 8px; font: 12px/1.2 sans-serif;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <div id="status">Инициализация…</div>
+
+  <script>
+    // 0) Telegram Mini App обвязка
+    const tg = window.Telegram?.WebApp;
+    try { tg?.ready(); tg?.expand(); } catch(e){ /* на десктопе вне TG просто игнорируем */ }
+
+    // 1) Параметры графика и загрузки
+    const SYMBOL = "SBER";
+    const BOARD = "TQBR";        // основной режим для SBER
+    const INTERVAL = 1;          // 1 = минуты (варианты: 1, 5, 10, 60)
+    const POLL_MS = 3000;        // опрос каждые 3 секунды
+    const LOOKBACK_MIN = 120;    // грузим примерно 2 часа истории при старте
+
+    const statusEl = document.getElementById("status");
+    const setStatus = (s) => statusEl.textContent = s;
+
+    // 2) Хелперы для MOEX ISS (candles.json)
+    // Документация: /iss/engines/stock/markets/shares/boards/TQBR/securities/SBER/candles.json
+    function moexCandlesUrl(fromIso, tillIso) {
+      const base = `https://iss.moex.com/iss/engines/stock/markets/shares/boards/${BOARD}/securities/${SYMBOL}/candles.json`;
+      const p = new URLSearchParams({
+        interval: String(INTERVAL),
+        from: fromIso,
+        till: tillIso,
+        "iss.only": "candles",
+        "iss.meta": "off"
+      });
+      return `${base}?${p.toString()}`;
+    }
+    function toIso(dt) {
+      // MOEX понимает ISO без таймзоны; дадим локальное ISO без миллисекунд
+      const pad = (n)=> String(n).padStart(2,"0");
+      return `${dt.getFullYear()}-${pad(dt.getMonth()+1)}-${pad(dt.getDate())}T${pad(dt.getHours())}:${pad(dt.getMinutes())}:${pad(dt.getSeconds())}`;
+    }
+
+    // 3) Данные графика (в индексах времени, чтобы было просто)
+    let xValues = [];   // 0..N-1
+    let open = [], high = [], low = [], close = [];
+    let tIndexByBegin = new Map(); // ключ: begin ISO -> индекс
+
+    // 4) Инициализация SciChart
+    let sciChartSurface, wasmContext, series, ds;
+
+    async function initChart() {
+      const { SciChartSurface, NumericAxis, FastCandlestickRenderableSeries, OhlcDataSeries, ZoomPanModifier, MouseWheelZoomModifier, ZoomExtentsModifier, RolloverModifier, SciChartJsNavyTheme } = SciChart;
+
+      // (Опционально) тема
+      SciChartSurface.setRuntimeLicenseKey(""); // Community — можно оставить пусто
+      const init = await SciChartSurface.create("root", { theme: new SciChartJsNavyTheme() });
+      sciChartSurface = init.sciChartSurface;
+      wasmContext = init.wasmContext;
+
+      // Оси
+      const xAxis = new NumericAxis(wasmContext);
+      const yAxis = new NumericAxis(wasmContext);
+      xAxis.drawMajorGridLines = false;
+      xAxis.drawMinorGridLines = false;
+      yAxis.drawMajorGridLines = true;
+      yAxis.drawMinorGridLines = false;
+
+      sciChartSurface.xAxes.add(xAxis);
+      sciChartSurface.yAxes.add(yAxis);
+
+      // Серия
+      ds = new OhlcDataSeries(wasmContext, { xValues, openValues: open, highValues: high, lowValues: low, closeValues: close });
+      series = new FastCandlestickRenderableSeries(wasmContext, { dataSeries: ds });
+      sciChartSurface.renderableSeries.add(series);
+
+      // Модификаторы (навигация)
+      sciChartSurface.chartModifiers.add(
+        new ZoomPanModifier({ enableZoom: true }),
+        new MouseWheelZoomModifier(),
+        new ZoomExtentsModifier(),
+        new RolloverModifier({ showTooltip: true })
+      );
+    }
+
+    // 5) Загрузка истории за последний lookback
+    async function loadInitial() {
+      const till = new Date();
+      const from = new Date(till.getTime() - LOOKBACK_MIN * 60_000);
+      const url = moexCandlesUrl(toIso(from), toIso(till));
+      const json = await (await fetch(url)).json();
+
+      if (!json?.candles?.data?.length) {
+        setStatus("Нет данных от MOEX");
+        return;
+      }
+
+      const cols = json.candles.columns;
+      const data = json.candles.data;
+
+      const ci = {
+        open: cols.indexOf("open"),
+        close: cols.indexOf("close"),
+        high: cols.indexOf("high"),
+        low:  cols.indexOf("low"),
+        begin: cols.indexOf("begin")
+      };
+
+      xValues.length = open.length = high.length = low.length = close.length = 0;
+      tIndexByBegin.clear();
+
+      data.forEach((row, i) => {
+        const t = row[ci.begin];  // строка времени "YYYY-MM-DDTHH:MM:SS"
+        const o = +row[ci.open], h = +row[ci.high], l = +row[ci.low], c = +row[ci.close];
+        xValues.push(i);
+        open.push(o); high.push(h); low.push(l); close.push(c);
+        tIndexByBegin.set(t, i);
+      });
+
+      ds.clear();
+      ds.appendRange(xValues, open, high, low, close);
+      sciChartSurface.zoomExtents();
+      setStatus(`Загружено ${data.length} свечей`);
+    }
+
+    // 6) Догрузка/обновление каждые 3 секунды
+    // Логика: тянем небольшой хвост "сейчас - 30 минут .. сейчас", мержим по begin
+    async function pollTail() {
+      try {
+        const till = new Date();
+        const from = new Date(till.getTime() - 30 * 60_000);
+        const url = moexCandlesUrl(toIso(from), toIso(till));
+        const json = await (await fetch(url)).json();
+        const cols = json.candles.columns;
+        const data = json.candles.data || [];
+
+        const ci = {
+          open: cols.indexOf("open"),
+          close: cols.indexOf("close"),
+          high: cols.indexOf("high"),
+          low:  cols.indexOf("low"),
+          begin: cols.indexOf("begin")
+        };
+
+        let appended = 0, updated = 0;
+
+        for (const row of data) {
+          const t = row[ci.begin];
+          const o = +row[ci.open], h = +row[ci.high], l = +row[ci.low], c = +row[ci.close];
+
+          if (tIndexByBegin.has(t)) {
+            // обновляем существующую свечу
+            const i = tIndexByBegin.get(t);
+            open[i] = o; high[i] = h; low[i] = l; close[i] = c;
+            updated++;
+          } else {
+            // добавляем новую свечу в конец
+            const i = xValues.length;
+            xValues.push(i);
+            open.push(o); high.push(h); low.push(l); close.push(c);
+            tIndexByBegin.set(t, i);
+            appended++;
+          }
+        }
+
+        // Обновляем DataSeries (самый простой способ — перезаписать целиком)
+        ds.clear();
+        ds.appendRange(xValues, open, high, low, close);
+
+        setStatus(`Обновлено: +${appended}, изменено: ${updated} | всего: ${xValues.length}`);
+      } catch (e) {
+        setStatus("Ошибка загрузки: " + e.message);
+      }
+    }
+
+    // 7) Старт
+    (async function start() {
+      await initChart();
+      await loadInitial();
+      setInterval(pollTail, POLL_MS);
+    })();
+  </script>
+</body>
+</html>
